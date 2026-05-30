@@ -98,8 +98,8 @@ def detect_resources():
     # UNetSAISELD is lighter than Mask R-CNN; can fit larger batches
     if   gpu_vram_gb >= 40: batch_size = 48
     elif gpu_vram_gb >= 24: batch_size = 24
-    elif gpu_vram_gb >= 16: batch_size = 32
-    else:                   batch_size = 12
+    elif gpu_vram_gb >= 16: batch_size = 16
+    else:                   batch_size = 8
 
     pin = torch.cuda.is_available()
 
@@ -124,8 +124,8 @@ IMG_W, IMG_H = 360, 180
 NUM_CLASSES  = 14      # 13 sound classes + background
 NUM_EPOCHS   = 10
 
-TRAIN_FRAMES_PER_EPOCH = 150
-VAL_FRAMES_PER_EPOCH   = 150
+TRAIN_FRAMES_PER_EPOCH = 15
+VAL_FRAMES_PER_EPOCH   = 15
 
 DIST_NORM        = 500.0
 ENERGY_ANNOT_W   = 5.0
@@ -162,9 +162,10 @@ def apply_encoder_freeze(model: UNetSAISELD, epoch: int) -> str:
         for module in (model.enc0, model.enc1, model.enc2):
             for p in module.parameters():
                 p.requires_grad = False
-        for module in (model.enc3, model.bridge_conv,
-                       model.skip_pool3, model.skip_pool2, model.skip_pool1,
-                       model.dec3, model.dec2, model.dec1, model.dec0,
+        for module in (model.enc3,
+                    #     model.bridge_pool, model.bridge_conv,
+                    #    model.skip_pool3, model.skip_pool2, model.skip_pool1,
+                    #    model.dec3, model.dec2, model.dec1, model.dec0,
                        model.energy_head, model.mask_head, model.distance_head):
             for p in module.parameters():
                 p.requires_grad = True
@@ -365,8 +366,8 @@ def train(train_infos, val_infos, exp_dir):
         list(model.enc3.parameters())
     )
     head_params = (
-        list(model.bridge_conv.parameters()) +
-        list(model.dec3.parameters()) +
+        # list(model.bridge_conv.parameters()) +
+        # list(model.dec3.parameters()) +
         list(model.dec2.parameters()) +
         list(model.dec1.parameters()) +
         list(model.dec0.parameters()) +
@@ -452,7 +453,7 @@ def train(train_infos, val_infos, exp_dir):
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                loss_dict = model(images, targets)
+                loss_dict = model(images, targets, epoch=epoch)
                 total     = sum(loss_dict.values())
 
             scaler.scale(total).backward()
@@ -492,7 +493,7 @@ def train(train_infos, val_infos, exp_dir):
                         for t in targets
                     ]
                     with torch.amp.autocast("cuda", enabled=use_amp):
-                        loss_dict = model(images, targets)
+                        loss_dict = model(images, targets, epoch=epoch)
                         val_tot   = sum(loss_dict.values())
                     val_ep_losses["total"] += val_tot.item()
                     for k, v in loss_dict.items():

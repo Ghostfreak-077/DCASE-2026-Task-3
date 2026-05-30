@@ -2,75 +2,74 @@
 #  ENERGY-FIELD INSTANCE SEGMENTATION  —  INFERENCE SCRIPT
 #  run_inference.py  (UNetSAISELD / Path B1 edition)
 #
-#  Usage:
-#      python run_inference.py --exp_dir experiments/unet_run_...
-#      python run_inference.py --exp_dir path --score_thr 0.25
-#      python run_inference.py --exp_dir path --split test --num_seqs 5
+#  Merge notes
+#  -----------
+#  Taken from mentor's run_inference__3_.py:
+#    - TemporalTracker (dataclass Track, min_age/confirmed pattern, no coast_decay)
+#    - numpy box_iou + nms_per_class  (no torchvision dependency)
+#    - Two-pass inference with adaptive per-class score gating
+#      (collects all sequence scores → stretches to [0.05,0.95] → thresholds
+#       on SCALED score, submits RAW score to preserve mAP ranking)
+#    - Spatial fragment merging (clusters same-class tracks within 50px,
+#       emits one merged annotation per cluster)
+#    - Per-class detection funnel printout
 #
-#  Filtering pipeline (in order, identical to baseline):
-#    1. Score threshold       — drop low-confidence detections
-#    2. Per-class NMS         — remove spatially overlapping boxes
-#    3. Per-frame class cap   — at most N detections per class per frame
-#    4. Track confirmation    — only export tracks seen >= min_hits frames
-#    5. Energy sparsification — export top-K energy points per detection
+#  Kept from our version:
+#    - SalsaFeatureExtractor  (no UpLAM, no RGB frames)
+#    - UNetSAISELD model loading
+#    - (4, T, F) audio-only InferenceDataset
+#    - sparsify_energy_map for full (H, W) energy maps (not 28×28)
+#    - exp_dir structure, Logger, JSON-based sequence discovery
+#    - score_thr default 0.15 (energy-calibrated, not sigmoid-raw)
 #
-#  Changes vs baseline run_inference.py:
-#    - AcousticFeatureExtractor  →  SalsaFeatureExtractor  (no UpLAM)
-#    - EnergyInstanceModel       →  UNetSAISELD
-#    - InferenceDataset          →  audio-only, outputs (4, T, F) tensors
-#    - energy_maps are (H, W) full-res instead of 28×28 RoI crops
-#    - sparsify_energy_map works on full-res maps
-#    - checkpoint default: unet_saiseld_best.pth
-#    - All output format, filtering, JSON structure: UNCHANGED
+#  Conflicts resolved:
+#    - extract_peaks (28×28 EVAL space) → replaced by sparsify_energy_map
+#    - tracker empty-update placeholder shape (0,28,28) → (0,H,W)
+#    - InferenceDataset stays SALSA-only; worker init uses SalsaFeatureExtractor
 # ============================================================
 
 import argparse
-import importlib.util
 import json
 import math
 import os
+import random
 import sys
 import time
 import warnings
-import random
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
-
-import torch._dynamo
-torch._dynamo.disable()
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision.ops import nms
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# ── Resolve script directory so imports always work ──────────────────────────
+# ── Resolve script directory ──────────────────────────────────────────────────
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# ── Import from our new modules ───────────────────────────────────────────────
 from acoustic_features import SalsaFeatureExtractor, wav_path_from_seq_dir
 from model import (
     UNetSAISELD,
-    InstanceTracker,
     get_sequence_infos,
     scan_available_frames,
-    frame_path,
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MLOps UTILITIES  (unchanged)
+#  UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-class Logger(object):
+class Logger:
     def __init__(self, filename, stream=sys.stdout):
         self.terminal = stream
-        self.log = open(filename, "a", encoding="utf-8")
+        self.log      = open(filename, "a", encoding="utf-8")
 
     def write(self, message):
         self.terminal.write(message)
@@ -99,23 +98,22 @@ FRAMES_BASE = "/teamspace/studios/this_studio/data/"
 LABELS_BASE = "/teamspace/studios/this_studio/data/labels_dev"
 MIC_BASE    = "/teamspace/studios/this_studio/data/foa_dev"
 
-IMG_W        = 360
-IMG_H        = 180
-N_CHANNELS   = 4          # SALSA-Lite: 1 log-mel + 3 NIPV (no RGB, no UpLAM)
-NUM_CLASSES  = 14
+IMG_W, IMG_H = 360, 180
+N_CHANNELS   = 4        # SALSA-Lite: 1 log-mel + 3 NIPV
+NUM_CLASSES  = 14       # 0=background, 1-13=foreground
 DIST_NORM    = 500.0
 INFERENCE_HZ = 10
-SCORE_THR    = 0.05
-ENERGY_EXPORT_THR = 0.10
-COAST_DECAY  = 0.9
 
-# SALSA-Lite extractor hyperparams (must match train.py)
-SALSA_FS           = 24000
-SALSA_N_FFT        = 512
-SALSA_HOP          = 300
-SALSA_FMIN_DOA     = 40.0
-SALSA_FMAX_DOA     = 6000.0
-SALSA_FMAX_SPEC    = 6000.0
+# Model label (1-indexed) → submission category_id (0-indexed)
+MODEL_TO_CAT = {k: k - 1 for k in range(1, NUM_CLASSES)}
+
+# SALSA hyperparams — must match train.py
+SALSA_FS             = 24000
+SALSA_N_FFT          = 512
+SALSA_HOP            = 300
+SALSA_FMIN_DOA       = 40.0
+SALSA_FMAX_DOA       = 6000.0
+SALSA_FMAX_SPEC      = 6000.0
 SALSA_CONTEXT_FRAMES = 4
 
 if torch.cuda.is_available():
@@ -131,25 +129,14 @@ NUM_WORKERS = min(max(_CPU_COUNT - 1, 0), 16)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INFERENCE DATASET
-#  Key change: audio-only, outputs (4, T, F) SALSA-Lite tensors per frame.
-#  No RGB loading. No UpLAM dependency.
+#  INFERENCE DATASET  (audio-only, SALSA-Lite features)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InferenceDataset(Dataset):
-    def __init__(
-        self,
-        seq_dir:       str,
-        seq_name:      str,
-        frame_indices: list,
-        img_w:         int  = IMG_W,
-        img_h:         int  = IMG_H,
-    ):
+    def __init__(self, seq_dir: str, seq_name: str, frame_indices: list):
         self.seq_dir       = seq_dir
         self.seq_name      = seq_name
         self.frame_indices = frame_indices
-        self.img_w         = img_w
-        self.img_h         = img_h
         self.wav_path      = wav_path_from_seq_dir(seq_dir, FRAMES_BASE, MIC_BASE)
         self._extractor    = None   # lazy-init per worker
 
@@ -164,7 +151,7 @@ class InferenceDataset(Dataset):
                 fmax_spec        = SALSA_FMAX_SPEC,
                 ref_mic          = 0,
                 context_frames   = SALSA_CONTEXT_FRAMES,
-                audio_cache_size = 4,    # small per-worker cache
+                audio_cache_size = 4,
                 frame_cache_size = 128,
             )
 
@@ -175,108 +162,58 @@ class InferenceDataset(Dataset):
         self._ensure_extractor()
         fi     = self.frame_indices[idx]
         tensor = self._extractor.get_frame_bands(self.wav_path, fi)
-        # tensor: (4, T, F)  float32 on CPU
+        # tensor: (4, T, F) float32
         return fi, tensor
 
 
 def _worker_init(worker_id):
-    """Re-initialise the SALSA extractor in each worker process."""
     ds = torch.utils.data.get_worker_info().dataset
     ds._extractor = SalsaFeatureExtractor(
-        fs               = SALSA_FS,
-        n_fft            = SALSA_N_FFT,
-        hop_length       = SALSA_HOP,
-        fmin_doa         = SALSA_FMIN_DOA,
-        fmax_doa         = SALSA_FMAX_DOA,
-        fmax_spec        = SALSA_FMAX_SPEC,
-        ref_mic          = 0,
-        context_frames   = SALSA_CONTEXT_FRAMES,
-        audio_cache_size = 4,
-        frame_cache_size = 128,
+        fs=SALSA_FS, n_fft=SALSA_N_FFT, hop_length=SALSA_HOP,
+        fmin_doa=SALSA_FMIN_DOA, fmax_doa=SALSA_FMAX_DOA, fmax_spec=SALSA_FMAX_SPEC,
+        ref_mic=0, context_frames=SALSA_CONTEXT_FRAMES,
+        audio_cache_size=4, frame_cache_size=128,
     )
 
 
-def _collate(batch):
-    fis     = [x[0] for x in batch]
-    tensors = [x[1] for x in batch]
-    return fis, tensors
+def _collate(b):
+    return [x[0] for x in b], [x[1] for x in b]
 
 
 def build_loader(seq_dir, seq_name, frame_indices, batch_size, num_workers):
-    ds = InferenceDataset(
-        seq_dir       = seq_dir,
-        seq_name      = seq_name,
-        frame_indices = frame_indices,
-    )
+    ds = InferenceDataset(seq_dir=seq_dir, seq_name=seq_name,
+                          frame_indices=frame_indices)
     return DataLoader(
         ds,
         batch_size         = batch_size,
         shuffle            = False,
         num_workers        = num_workers,
         pin_memory         = torch.cuda.is_available(),
-        prefetch_factor    = 4 if num_workers > 0 else None,
+        prefetch_factor    = 2 if num_workers > 0 else None,
         worker_init_fn     = _worker_init if num_workers > 0 else None,
-        persistent_workers = num_workers > 0,
-        drop_last          = False,
         collate_fn         = _collate,
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ARGUMENT PARSING  (unchanged interface; removed --audio_only since Track A
-#  is always audio-only; updated default checkpoint name)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Run trained UNetSAISELD on test sequences (Track A).")
-
-    p.add_argument("--exp_dir",    type=str, required=True)
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Override checkpoint path. Defaults to unet_saiseld_best.pth in exp_dir.")
-    p.add_argument("--split",      default="test")
-    p.add_argument("--num_seqs",   type=int, default=None)
-    p.add_argument("--seed",       type=int, default=42)
-
-    p.add_argument("--score_thr",          type=float, default=0.25,
-                   help="Detection score threshold (default 0.25 — lower than MRCNN baseline "
-                        "since U-Net scores are calibrated differently)")
-    p.add_argument("--nms_iou_thr",        type=float, default=0.30)
-    p.add_argument("--max_dets_per_class", type=int,   default=3)
-    p.add_argument("--min_hits",           type=int,   default=2)
-    p.add_argument("--energy_top_k",       type=int,   default=20)
-    p.add_argument("--energy_export_thr",  type=float, default=ENERGY_EXPORT_THR)
-
-    p.add_argument("--iou_thr",     type=float, default=0.3)
-    p.add_argument("--max_age",     type=int,   default=5)
-    p.add_argument("--coast_decay", type=float, default=COAST_DECAY)
-
-    p.add_argument("--batch_size",  type=int, default=48,
-                   help="Frames per forward pass (UNet is lighter; default 48)")
-    p.add_argument("--num_workers", type=int, default=NUM_WORKERS)
-    p.add_argument("--num_classes", type=int, default=NUM_CLASSES)
-    return p.parse_args()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  MODEL LOADING
-#  Instantiates UNetSAISELD and loads the checkpoint saved by train.py.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_model(checkpoint_path: str, num_classes: int) -> UNetSAISELD:
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    print(f"[INFO] Loading checkpoint: {checkpoint_path}")
 
-    print(f"[INFO] Loading checkpoint : {checkpoint_path}")
     model = UNetSAISELD(
         n_classes = num_classes,
-        in_ch     = N_CHANNELS,   # 4 SALSA-Lite channels
+        in_ch     = N_CHANNELS,
         img_h     = IMG_H,
         img_w     = IMG_W,
     )
     state = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
+    if isinstance(state, dict):
+        if   "model_state"      in state: state = state["model_state"]
+        elif "model_state_dict" in state: state = state["model_state_dict"]
 
     missing, unexpected = model.load_state_dict(state, strict=True)
     if missing:    print(f"[WARN] Missing keys    : {missing}")
@@ -290,337 +227,460 @@ def load_model(checkpoint_path: str, num_classes: int) -> UNetSAISELD:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MULTI-STAGE FILTERING  (logic identical; adapted for full-res energy maps)
+#  NMS  (mentor's self-contained numpy implementation — no torchvision needed)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def filter_detections(det, score_thr, nms_iou_thr, max_dets_per_class):
-    boxes       = det.get("boxes",       torch.zeros(0, 4))
-    labels      = det.get("labels",      torch.zeros(0, dtype=torch.long))
-    scores      = det.get("scores",      torch.zeros(0))
-    # energy_maps: (N, H, W) full-resolution from UNetSAISELD
-    energy_maps = det.get("energy_maps", torch.zeros(0, IMG_H, IMG_W))
-    dist_pred   = det.get("dist_pred",   torch.zeros(0))
-    N           = scores.shape[0]
+def box_iou(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    ix1 = np.maximum(box[0], boxes[:, 0])
+    iy1 = np.maximum(box[1], boxes[:, 1])
+    ix2 = np.minimum(box[2], boxes[:, 2])
+    iy2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.maximum(ix2 - ix1, 0.0) * np.maximum(iy2 - iy1, 0.0)
+    a1    = (box[2] - box[0]) * (box[3] - box[1])
+    a2    = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    union = a1 + a2 - inter + 1e-6
+    return inter / union
 
-    _empty = {
-        **det,
-        "boxes":       torch.zeros(0, 4),
-        "labels":      torch.zeros(0, dtype=torch.long),
-        "scores":      torch.zeros(0),
-        "energy_maps": torch.zeros(0, IMG_H, IMG_W),
-        "dist_pred":   torch.zeros(0),
-    }
 
-    if N == 0:
-        return _empty
-
-    # Stage 1: score threshold
-    keep = scores >= score_thr
-    if not keep.any():
-        return _empty
-
-    def _sel(t, mask):
-        return t[mask] if isinstance(t, torch.Tensor) and t.shape[0] == N else t
-
-    boxes       = _sel(boxes, keep)
-    labels      = _sel(labels, keep)
-    scores      = _sel(scores, keep)
-    energy_maps = _sel(energy_maps, keep)
-    dist_pred   = _sel(dist_pred, keep)
-    N = scores.shape[0]
-
-    # Stage 2: per-class NMS
-    keep_nms = []
-    for cls in labels.unique():
-        m   = labels == cls
-        idx = m.nonzero(as_tuple=True)[0]
-        keep_nms.append(idx[nms(boxes[idx], scores[idx], nms_iou_thr)])
-    if not keep_nms:
-        return _empty
-    ki = torch.cat(keep_nms)
-    ki = ki[scores[ki].argsort(descending=True)]
-
-    def _idx_sel(t):
-        return t[ki] if isinstance(t, torch.Tensor) and t.shape[0] >= ki.max() + 1 else t
-
-    boxes       = _idx_sel(boxes)
-    labels      = _idx_sel(labels)
-    scores      = _idx_sel(scores)
-    energy_maps = _idx_sel(energy_maps)
-    dist_pred   = _idx_sel(dist_pred)
-
-    # Stage 3: per-frame class cap
-    keep_cap = []
-    for cls in labels.unique():
-        idx = (labels == cls).nonzero(as_tuple=True)[0]
-        keep_cap.append(idx[:max_dets_per_class])
-    if not keep_cap:
-        return _empty
-    ki2 = torch.cat(keep_cap)
-
-    def _idx_sel2(t):
-        return t[ki2] if isinstance(t, torch.Tensor) and t.shape[0] >= ki2.max() + 1 else t
-
-    return {
-        **det,
-        "boxes":       _idx_sel2(boxes),
-        "labels":      _idx_sel2(labels),
-        "scores":      _idx_sel2(scores),
-        "energy_maps": _idx_sel2(energy_maps),
-        "dist_pred":   _idx_sel2(dist_pred),
-    }
+def nms_per_class(
+    boxes:   np.ndarray,
+    labels:  np.ndarray,
+    scores:  np.ndarray,
+    iou_thr: float = 0.45,
+) -> np.ndarray:
+    keep = []
+    for cls in np.unique(labels):
+        idx   = np.where(labels == cls)[0]
+        s, b  = scores[idx], boxes[idx]
+        order = np.argsort(-s)
+        alive = np.ones(len(order), dtype=bool)
+        for i, oi in enumerate(order):
+            if not alive[i]:
+                continue
+            keep.append(idx[oi])
+            ious = box_iou(b[oi], b[order[i + 1:]])
+            for j, iou in enumerate(ious):
+                if iou > iou_thr:
+                    alive[i + 1 + j] = False
+    return np.array(keep, dtype=int)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENERGY SPARSIFICATION
-#  Adapted for full-resolution (H, W) energy maps from UNetSAISELD.
-#  The baseline used 28×28 RoI crops and interpolated back to box coordinates.
-#  We now work directly in equirectangular pixel space — no interpolation needed.
+#  TRACKER  (mentor's TemporalTracker — cleaner min_age/confirmed pattern)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def sparsify_energy_map(emap: np.ndarray, box: list, top_k: int, thr: float) -> list:
+@dataclass
+class Track:
+    track_id:  int
+    label:     int
+    score:     float
+    box:       np.ndarray
+    emap:      np.ndarray    # (H, W) full-res energy map
+    dist_pred: Optional[float]
+    age:       int  = 1      # frames seen (increments on match)
+    missed:    int  = 0      # consecutive unmatched frames
+    confirmed: bool = False  # True once age >= min_age
+
+
+class TemporalTracker:
     """
-    Extract top-K energy peaks from a full-resolution (H, W) energy map,
-    restricted to the bounding box region of the detection.
-
-    Parameters
-    ----------
-    emap : (H, W) float32 numpy array — full equirectangular energy map
-    box  : [x0, y0, x1, y1] in pixel coords
-    top_k: max number of peaks to export
-    thr  : minimum energy threshold (fraction of max in region)
-
-    Returns
-    -------
-    List of [x, y, intensity] triplets, sorted by descending intensity.
-    Format matches the DCASE 2026 submission spec exactly.
+    Mentor's tracker: confirms tracks after min_age hits, prunes after
+    max_missed consecutive misses. No coast_decay — cleaner and removes
+    the source of permanent-track drift in our earlier version.
     """
-    x0, y0, x1, y1 = box
-    # Clamp box to canvas bounds
+    def __init__(
+        self,
+        iou_thr:    float = 0.30,
+        min_age:    int   = 2,
+        max_missed: int   = 2,
+    ):
+        self.iou_thr    = iou_thr
+        self.min_age    = min_age
+        self.max_missed = max_missed
+        self._tracks: List[Track] = []
+        self._next_id = 0
+
+    def reset(self):
+        self._tracks  = []
+        self._next_id = 0
+
+    def update(
+        self,
+        boxes:      np.ndarray,          # (N, 4)
+        labels:     np.ndarray,          # (N,)
+        scores:     np.ndarray,          # (N,)
+        emaps:      np.ndarray,          # (N, H, W)
+        dist_preds: Optional[np.ndarray],# (N,) or None
+    ) -> List[Track]:
+        n_det           = len(labels)
+        unmatched_dets  = list(range(n_det))
+        matched_track_i = set()
+
+        if self._tracks and n_det > 0:
+            track_boxes = np.stack([t.box for t in self._tracks])
+            cost = np.zeros((n_det, len(self._tracks)))
+            for di in range(n_det):
+                ious = box_iou(boxes[di], track_boxes)
+                for ti, t in enumerate(self._tracks):
+                    cost[di, ti] = ious[ti] if t.label == labels[di] else 0.0
+
+            flat = np.argsort(-cost.ravel())
+            for f in flat:
+                di, ti = divmod(int(f), len(self._tracks))
+                if cost[di, ti] < self.iou_thr:
+                    break
+                if di not in unmatched_dets or ti in matched_track_i:
+                    continue
+                t           = self._tracks[ti]
+                t.box       = boxes[di]
+                t.score     = scores[di]
+                t.emap      = emaps[di]
+                t.dist_pred = float(dist_preds[di]) if dist_preds is not None else None
+                t.age      += 1
+                t.missed    = 0
+                if t.age >= self.min_age:
+                    t.confirmed = True
+                unmatched_dets.remove(di)
+                matched_track_i.add(ti)
+
+        # Increment missed counter for unmatched existing tracks
+        for ti, t in enumerate(self._tracks):
+            if ti not in matched_track_i:
+                t.missed += 1
+
+        # Spawn new tracks for unmatched detections
+        for di in unmatched_dets:
+            self._tracks.append(Track(
+                track_id  = self._next_id,
+                label     = int(labels[di]),
+                score     = float(scores[di]),
+                box       = boxes[di].copy(),
+                emap      = emaps[di].copy(),
+                dist_pred = float(dist_preds[di]) if dist_preds is not None else None,
+            ))
+            self._next_id += 1
+
+        # Prune dead tracks
+        self._tracks = [t for t in self._tracks if t.missed <= self.max_missed]
+        # Return only confirmed tracks
+        return [t for t in self._tracks if t.confirmed]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PEAK EXTRACTION  (our full-res version, adapted from mentor's interface)
+#
+#  Mentor's extract_peaks worked on 28×28 RoI crops in EVAL (100×50) space.
+#  UNetSAISELD energy maps are full (H, W) = (180, 360) in canvas pixel space.
+#  We crop to the bounding box region, find top-K peaks, and return
+#  [x, y, intensity] triplets in the [0,359]×[0,179] submission coordinate space.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_peaks(
+    emap_raw:  np.ndarray,   # (H, W) full equirectangular energy map
+    box_xyxy:  np.ndarray,   # [x0, y0, x1, y1] in canvas pixel coords
+    n_peaks:   int = 20,
+) -> List[List[float]]:
+    x0, y0, x1, y1 = box_xyxy
     xi0 = max(0, int(math.floor(x0)))
     yi0 = max(0, int(math.floor(y0)))
-    xi1 = min(emap.shape[1], int(math.ceil(x1)))
-    yi1 = min(emap.shape[0], int(math.ceil(y1)))
+    xi1 = min(IMG_W, int(math.ceil(x1)))
+    yi1 = min(IMG_H, int(math.ceil(y1)))
 
     if xi1 <= xi0 or yi1 <= yi0:
-        # Degenerate box — fall back to global peak
-        pk  = int(emap.argmax())
-        py, px = divmod(pk, emap.shape[1])
-        return [[float(px), float(py), float(emap.flat[pk])]]
+        # Degenerate box → fall back to global peak
+        pk      = int(emap_raw.argmax())
+        py, px  = divmod(pk, emap_raw.shape[1])
+        return [[float(px), float(py), float(emap_raw.flat[pk])]]
 
-    region = emap[yi0:yi1, xi0:xi1]    # (roi_h, roi_w)
-    flat   = region.flatten()
-    n_pts  = flat.shape[0]
+    region = emap_raw[yi0:yi1, xi0:xi1]   # (roi_h, roi_w)
 
-    # Top-K selection
-    if 0 < top_k < n_pts:
-        top_idx = np.argpartition(flat, -top_k)[-top_k:]
+    # Normalise within region so intensity is relative to local peak
+    emin, emax = region.min(), region.max()
+    if emax - emin < 1e-8:
+        norm = np.ones_like(region)
     else:
-        top_idx = np.arange(n_pts)
+        norm = (region - emin) / (emax - emin)
 
-    # Apply threshold relative to region peak
-    region_max = flat.max()
-    abs_thr    = thr * region_max if region_max > 1e-9 else thr
-    top_idx    = top_idx[flat[top_idx] >= abs_thr]
+    flat    = norm.ravel()
+    n_peaks = min(n_peaks, flat.size)
+    top_idx = np.argpartition(flat, -n_peaks)[-n_peaks:]
+    top_idx = top_idx[np.argsort(-flat[top_idx])]
 
-    triplets = []
-    roi_h = yi1 - yi0
     roi_w = xi1 - xi0
+    triplets = []
     for i in top_idx:
         ry, rx = divmod(int(i), roi_w)
-        # Convert back to full-canvas coordinates
-        x_coord = float(xi0 + rx)
-        y_coord = float(yi0 + ry)
+        ox = float(xi0 + rx)
+        oy = float(yi0 + ry)
         # Clamp to valid submission range
-        x_coord = max(0.0, min(359.0, x_coord))
-        y_coord = max(0.0, min(179.0, y_coord))
-        triplets.append([
-            round(x_coord, 4),
-            round(y_coord, 4),
-            round(float(flat[i]), 6),
-        ])
+        ox = min(max(ox, 0.0), float(IMG_W - 1))
+        oy = min(max(oy, 0.0), float(IMG_H - 1))
+        triplets.append([round(ox, 2), round(oy, 2), round(float(flat[i]), 4)])
 
-    # Guarantee at least one triplet
-    if not triplets:
-        pk  = int(flat.argmax())
-        ry, rx = divmod(pk, roi_w)
-        x_coord = max(0.0, min(359.0, float(xi0 + rx)))
-        y_coord = max(0.0, min(179.0, float(yi0 + ry)))
-        triplets.append([round(x_coord, 4), round(y_coord, 4), round(float(flat[pk]), 6)])
-
-    triplets.sort(key=lambda t: -t[2])
     return triplets
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PER-SEQUENCE INFERENCE  (unchanged logic; removed audio_only arg)
+#  PER-SEQUENCE INFERENCE  (mentor's two-pass approach with adaptive gating)
+#
+#  Pass 1: run model on all frames, accumulate (labels, scores, boxes, emaps).
+#          Also collect all per-class scores to compute global min/max.
+#  Pass 2: adaptive gating — stretch per-class scores to [0.05, 0.95],
+#          threshold on SCALED score, submit RAW score (preserves mAP ranking).
+#          Then NMS → TemporalTracker → fragment merging → emit annotations.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_inference_on_sequence(
-    model, seq_dir, seq_name, frame_indices,
-    score_thr, nms_iou_thr, max_dets_per_class,
-    min_hits, iou_thr, max_age, batch_size, num_workers,
-    coast_decay=COAST_DECAY,
-):
-    assert not model.training
+def infer_sequence(
+    model,
+    seq_dir:      str,
+    seq_name:     str,
+    frame_indices: List[int],   # passed from main() = annotated_ids | disk_ids
+    batch_size:   int,
+    num_workers:  int,
+    score_thr:    float,
+    nms_iou:      float,
+    track_iou:    float,
+    min_age:      int,
+    max_missed:   int,
+    n_peaks:      int,
+    dist_scale:   float,
+) -> List[dict]:
+
+    # frame_indices is provided by main() as the union of annotated frame
+    # indices (from the GT JSON) and on-disk PNG indices.  This ensures
+    # inference runs even when no video frames are on disk (audio-only mode).
+    if not frame_indices:
+        return []
+
     loader  = build_loader(seq_dir, seq_name, frame_indices, batch_size, num_workers)
-    tracker = InstanceTracker(iou_thr=iou_thr, max_age=max_age, coast_decay=coast_decay,
-                              img_w=IMG_W, img_h=IMG_H)
-    results = []
-    track_score_memory: dict = {}
+    tracker = TemporalTracker(iou_thr=track_iou, min_age=min_age, max_missed=max_missed)
     use_amp = torch.cuda.is_available()
-    n_raw = n_kept = 0
-    seq_t0 = time.time()
+    annotations: List[dict] = []
+
+    # ── Pass 1: accumulate all frame predictions ──────────────────────────
+    frame_data_accum = []
+    class_scores     = {c: [] for c in range(1, NUM_CLASSES)}
 
     with torch.no_grad():
-        pbar = tqdm(
-            loader,
-            total        = math.ceil(len(frame_indices) / batch_size),
-            desc         = f"  {seq_name[:35]}",
-            unit         = "batch",
-            dynamic_ncols= True,
-            leave        = True,
-        )
-
-        for batch_fi, batch_tensors in pbar:
-            # batch_tensors: list of (4, T, F) tensors
-            images_gpu = [t.to(DEVICE, non_blocking=True).float() for t in batch_tensors]
-
+        for bf, bt in tqdm(loader, desc=f"  {seq_name[:40]} [Infer]", unit="batch"):
+            imgs = [t.to(DEVICE, non_blocking=True).float() for t in bt]
             with torch.amp.autocast("cuda", enabled=use_amp):
-                preds_batch = model(images_gpu, None)
+                preds_batch = model(imgs, None)
 
-            for fi, det_raw in zip(batch_fi, preds_batch):
-                det = {k: (v.cpu() if isinstance(v, torch.Tensor) else v)
-                       for k, v in det_raw.items()}
+            for fi, dr in zip(bf, preds_batch):
+                fi = int(fi)
 
+                def _get(keys):
+                    for k in keys:
+                        if k in dr:
+                            v = dr[k]
+                            return v.cpu().numpy() if isinstance(v, torch.Tensor) else v
+                    return None
 
-                n_raw  += int(det.get("scores", torch.zeros(0)).shape[0])
-                det     = filter_detections(det, score_thr, nms_iou_thr, max_dets_per_class)
-                n_kept += int(det.get("scores", torch.zeros(0)).shape[0])
+                labels_np = _get(["labels", "pred_classes", "pred_labels"])
+                scores_np = _get(["scores", "pred_scores",  "confidences"])
+                boxes_np  = _get(["boxes",  "pred_boxes",   "bboxes"])
+                emaps_np  = _get(["energy_maps", "energy",  "heatmaps"])
+                dist_np   = _get(["dist_pred"])
 
-                tracked = tracker.update(det)
+                if labels_np is not None and scores_np is not None and boxes_np is not None:
+                    labels_np = labels_np.astype(int)
+                    scores_np = scores_np.astype(np.float32)
+                    boxes_np  = boxes_np.astype(np.float32)
+                    if emaps_np is not None:
+                        emaps_np = emaps_np.astype(np.float32)
+                    for l, s in zip(labels_np, scores_np):
+                        if l > 0:
+                            class_scores[l].append(float(s))
+                else:
+                    labels_np = scores_np = boxes_np = None
 
-                # Score memory with coast decay
-                for obj in tracked:
-                    tid = obj["track_id"]
-                    if not obj.get("coasting", False):
-                        track_score_memory[tid] = float(obj.get("score", 0.0))
-                    else:
-                        prev    = track_score_memory.get(tid, 0.0)
-                        decayed = prev * coast_decay
-                        track_score_memory[tid] = decayed
-                        obj["score"] = decayed
-                    obj["hits"] = (tracker.tracks[tid]["hits"]
-                                   if tid in tracker.tracks else obj.get("hits", 1))
+                frame_data_accum.append((fi, labels_np, scores_np, boxes_np, emaps_np, dist_np))
 
-                full_e = (det["full_energy"].numpy()
-                          if "full_energy" in det
-                          else np.zeros((IMG_H, IMG_W), dtype=np.float32))
+    # ── Compute per-class global min/max for adaptive score stretching ────
+    class_min_max = {}
+    for c, s_list in class_scores.items():
+        if s_list:
+            class_min_max[c] = (float(np.min(s_list)), float(np.max(s_list)))
+        else:
+            class_min_max[c] = (0.0, 1.0)
 
-                results.append(dict(
-                    frame       = int(fi),
-                    time_s      = int(fi) / INFERENCE_HZ,
-                    objects     = tracked,
-                    full_energy = full_e,
-                ))
+    stats_raw     = {c: 0 for c in range(1, NUM_CLASSES)}
+    stats_thresh  = {c: 0 for c in range(1, NUM_CLASSES)}
+    stats_nms     = {c: 0 for c in range(1, NUM_CLASSES)}
+    stats_emitted = {c: 0 for c in range(1, NUM_CLASSES)}
 
-            elapsed = max(time.time() - seq_t0, 1e-6)
-            pbar.set_postfix({
-                "fps":    f"{len(results)/elapsed:.1f}",
-                "raw":    n_raw,
-                "kept":   n_kept,
-                "tracks": len(tracker.tracks),
-            }, refresh=True)
+    # ── Pass 2: adaptive gating → NMS → tracker → fragment merging ───────
+    empty_emaps = np.zeros((0, IMG_H, IMG_W), dtype=np.float32)
 
-    elapsed = time.time() - seq_t0
-    n = len(frame_indices)
-    print(f"  [INFO] {n} frames in {elapsed:.1f}s  ({n/max(elapsed,1e-6):.1f} fps) | "
-          f"raw={n_raw}  after_filter={n_kept}")
-    return results
+    for fi, labels_np, scores_np, boxes_np, emaps_np, dist_np in frame_data_accum:
 
+        if labels_np is None:
+            tracker.update(np.zeros((0, 4)), np.zeros(0, int),
+                           np.zeros(0), empty_emaps, None)
+            continue
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  JSON SERIALISATION  (format identical to baseline — evaluator unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
+        for l in labels_np:
+            if l > 0:
+                stats_raw[l] += 1
 
-def dump_inference_json(results, save_path, min_hits, energy_top_k, energy_export_thr):
-    # First pass: find max track hits for confirmation filter
-    max_hits: dict = {}
-    for frame_result in results:
-        for obj in frame_result["objects"]:
-            tid = obj["track_id"]
-            max_hits[tid] = max(max_hits.get(tid, 0), obj.get("hits", 1))
+        # Adaptive gating: scale scores per-class, threshold on scaled,
+        # but keep raw scores for submission (preserves mAP ranking).
+        keep_mask = np.zeros(len(scores_np), dtype=bool)
+        for i in range(len(scores_np)):
+            c     = labels_np[i]
+            raw_s = scores_np[i]
+            if c > 0 and c in class_min_max:
+                cmin, cmax = class_min_max[c]
+                if cmax >= 0.08 and cmax > cmin:
+                    scaled_s = 0.05 + 0.90 * ((raw_s - cmin) / (cmax - cmin))
+                else:
+                    scaled_s = raw_s
+                if scaled_s >= score_thr:
+                    keep_mask[i] = True
 
-    annotations = []
-    for frame_result in results:
-        fi = frame_result["frame"]
-        for obj in frame_result["objects"]:
-            tid = obj["track_id"]
-            if max_hits.get(tid, 0) < min_hits:
+        keep = keep_mask & (labels_np > 0)
+        for l in labels_np[keep]:
+            stats_thresh[l] += 1
+
+        if keep.sum() == 0:
+            tracker.update(np.zeros((0, 4)), np.zeros(0, int),
+                           np.zeros(0), empty_emaps, None)
+            continue
+
+        labels_f = labels_np[keep]
+        scores_f = scores_np[keep]   # RAW scores — submitted as-is
+        boxes_f  = boxes_np[keep]
+        emaps_f  = emaps_np[keep] if emaps_np is not None else np.zeros((keep.sum(), IMG_H, IMG_W))
+        dist_f   = dist_np[keep]  if dist_np  is not None else None
+
+        nms_idx          = nms_per_class(boxes_f, labels_f, scores_f, iou_thr=nms_iou)
+        labels_f         = labels_f[nms_idx]
+        scores_f         = scores_f[nms_idx]
+        boxes_f          = boxes_f[nms_idx]
+        emaps_f          = emaps_f[nms_idx]
+        dist_f           = dist_f[nms_idx] if dist_f is not None else None
+
+        for l in labels_f:
+            stats_nms[l] += 1
+
+        confirmed = tracker.update(boxes_f, labels_f, scores_f, emaps_f, dist_f)
+
+        # Fragment merging: group confirmed tracks by category,
+        # cluster spatially adjacent ones (centres within 50px),
+        # emit one merged annotation per cluster.
+        emitted_by_cat = defaultdict(list)
+        for track in confirmed:
+            cat_id = MODEL_TO_CAT.get(track.label)
+            if cat_id is None:
                 continue
-
-            emap = obj["energy_map"]
-            if isinstance(emap, torch.Tensor):
-                emap = emap.numpy()
-
-            # energy_map from UNetSAISELD is full (H, W); box is in pixel coords
-            triplets = sparsify_energy_map(
-                emap, obj["box"], energy_top_k, energy_export_thr
-            )
-
-            annotations.append({
-                "metadata_frame_index": int(fi),
-                "instance_id"         : int(obj["track_id"]),
-                "category_id"         : int(obj["label"]) - 1,   # 0-indexed for submission
-                "score"               : round(float(obj.get("score", 0.0)), 6),
-                "distance"            : round(float(obj["dist_pred"]) * DIST_NORM, 4),
-                "segmentation"        : [triplets],
+            triplets = extract_peaks(track.emap, track.box, n_peaks=n_peaks)
+            if not triplets:
+                continue
+            emitted_by_cat[cat_id].append({
+                "box":      track.box,
+                "score":    float(track.score),
+                "triplets": triplets,
+                "dist":     float(track.dist_pred) * dist_scale
+                            if track.dist_pred is not None else None,
             })
 
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    with open(save_path, "w") as f:
-        json.dump({"annotations": annotations}, f, indent=2)
+        for cat_id, fragments in emitted_by_cat.items():
+            clusters = []
+            for frag in fragments:
+                cx = (frag["box"][0] + frag["box"][2]) / 2.0
+                cy = (frag["box"][1] + frag["box"][3]) / 2.0
+                placed = False
+                for clus in clusters:
+                    for c_frag in clus:
+                        ccx = (c_frag["box"][0] + c_frag["box"][2]) / 2.0
+                        ccy = (c_frag["box"][1] + c_frag["box"][3]) / 2.0
+                        if np.hypot(cx - ccx, cy - ccy) < 50.0:
+                            clus.append(frag)
+                            placed = True
+                            break
+                    if placed:
+                        break
+                if not placed:
+                    clusters.append([frag])
 
-    n_frames_out = len({a["metadata_frame_index"] for a in annotations})
-    print(f"  [JSON] {len(annotations):5d} annotations across "
-          f"{n_frames_out:4d} frames  →  {save_path}")
+            for clus in clusters:
+                all_triplets = []
+                max_score    = -1.0
+                dists        = []
+                for frag in clus:
+                    all_triplets.extend(frag["triplets"])
+                    if frag["score"] > max_score:
+                        max_score = frag["score"]
+                    if frag["dist"] is not None:
+                        dists.append(frag["dist"])
+
+                all_triplets.sort(key=lambda x: x[2], reverse=True)
+
+                original_cls = next(k for k, v in MODEL_TO_CAT.items() if v == cat_id)
+                stats_emitted[original_cls] += 1
+
+                entry: dict = {
+                    "metadata_frame_index": fi,
+                    "category_id":          cat_id,
+                    "score":                round(max_score, 5),
+                    "segmentation":         [all_triplets[:n_peaks * 2]],
+                }
+                if dists:
+                    entry["distance"] = round(sum(dists) / len(dists), 1)
+                annotations.append(entry)
+
+    # ── Per-class detection funnel (mentor's diagnostic printout) ─────────
+    print("\n  → Per-Class Detection Funnel:")
+    print("    Class |   Raw | >Thr |  NMS | Emitted | Score Range")
+    print("    " + "-" * 57)
+    for c in range(1, NUM_CLASSES):
+        if stats_raw[c] > 0 or stats_emitted[c] > 0:
+            cmin, cmax = class_min_max[c]
+            print(f"    {c:5d} | {stats_raw[c]:5d} | {stats_thresh[c]:4d} | "
+                  f"{stats_nms[c]:4d} | {stats_emitted[c]:7d} | "
+                  f"({cmin:.4f}, {cmax:.4f})")
+    print()
+
+    return annotations
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SUMMARY  (unchanged)
+#  ARGUMENT PARSING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_summary(results, seq_name, min_hits):
-    max_hits_summary: dict = {}
-    for r in results:
-        for o in r["objects"]:
-            tid = o["track_id"]
-            max_hits_summary[tid] = max(max_hits_summary.get(tid, 0), o.get("hits", 1))
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Submission-format inference — UNetSAISELD (Track A)")
 
-    confirmed  = [o for r in results for o in r["objects"]
-                  if max_hits_summary.get(o["track_id"], 0) >= min_hits]
-    n_frames   = len(results)
-    n_active   = sum(1 for r in results
-                     if any(max_hits_summary.get(o["track_id"], 0) >= min_hits
-                            for o in r["objects"]))
-    cat_counts: dict = defaultdict(int)
-    for o in confirmed:
-        cat_counts[int(o["label"]) - 1] += 1
-    duration_s = max((r["time_s"] for r in results), default=0.0)
+    p.add_argument("--exp_dir",    type=str, required=True,
+                   help="Experiment directory (e.g. experiments/unet_run_...)")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Override checkpoint. Defaults to unet_saiseld_best.pth in exp_dir.")
+    p.add_argument("--split",      default="test")
+    p.add_argument("--n_seqs",     type=int, default=-1,
+                   help="Number of sequences to process (-1 = all).")
+    p.add_argument("--output_dir", type=str, default=None,
+                   help="Where to write JSON files. Defaults to exp_dir/inference_outputs.")
+    p.add_argument("--batch_size", type=int, default=48)
+    p.add_argument("--num_workers",type=int, default=NUM_WORKERS)
+    p.add_argument("--num_classes",type=int, default=NUM_CLASSES)
+    p.add_argument("--seed",       type=int, default=42)
 
-    print(f"\n  +-- {seq_name}")
-    print(f"  |  Frames          : {n_frames:>6d}  ({duration_s:.1f}s)")
-    print(f"  |  Active frames   : {n_active:>6d}  ({100*n_active/max(n_frames,1):.1f}%)")
-    print(f"  |  Confirmed objs  : {len(confirmed):>6d}")
-    print(f"  |  Unique tracks   : {len({o['track_id'] for o in confirmed}):>6d}")
-    if cat_counts:
-        print(f"  |  Category counts : "
-              + "  ".join(f"C{c}:{n}" for c, n in sorted(cat_counts.items())))
-    print(f"  +{'--'*25}")
+    p.add_argument("--score_thr",  type=float, default=0.35,
+                   help="Threshold on SCALED (per-class normalised) score.")
+    p.add_argument("--nms_iou",    type=float, default=0.45)
+    p.add_argument("--track_iou",  type=float, default=0.30)
+    p.add_argument("--min_age",    type=int,   default=2)
+    p.add_argument("--max_missed", type=int,   default=2)
+    p.add_argument("--n_peaks",    type=int,   default=20)
+    p.add_argument("--dist_scale", type=float, default=DIST_NORM,
+                   help="Multiply model distance output by this to get centimetres.")
+    return p.parse_args()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN  (identical structure to baseline)
+#  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -629,60 +689,56 @@ def main():
 
     if args.checkpoint is None:
         args.checkpoint = os.path.join(args.exp_dir, "unet_saiseld_best.pth")
+    if args.output_dir is None:
+        args.output_dir = os.path.join(args.exp_dir, "inference_outputs")
 
-    args.out_dir = os.path.join(args.exp_dir, "inference_outputs")
-    os.makedirs(args.out_dir, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     sys.stdout = Logger(os.path.join(args.exp_dir, "inference.log"),       sys.stdout)
     sys.stderr = Logger(os.path.join(args.exp_dir, "inference_error.log"), sys.stderr)
 
     print(f"\n[INFO] Device              : {DEVICE}  [{_gpu_name}]")
-    print(f"[INFO] Model               : UNetSAISELD  ({N_CHANNELS}ch SALSA-Lite input)")
-    print(f"[INFO] Experiment Dir      : {args.exp_dir}")
-    print(f"[INFO] Output directory    : {args.out_dir}")
+    print(f"[INFO] Model               : UNetSAISELD  ({N_CHANNELS}ch SALSA-Lite)")
+    print(f"[INFO] Checkpoint          : {args.checkpoint}")
+    print(f"[INFO] Output directory    : {out_dir}")
     print(f"[INFO] batch_size          : {args.batch_size}")
     print(f"[INFO] num_workers         : {args.num_workers}")
     print(f"\n[INFO] ── Filtering pipeline ──────────────────────────────────")
-    print(f"[INFO]   Stage 1  score_thr          = {args.score_thr}")
-    print(f"[INFO]   Stage 2  nms_iou_thr        = {args.nms_iou_thr}")
-    print(f"[INFO]   Stage 3  max_dets_per_class = {args.max_dets_per_class}")
-    print(f"[INFO]   Stage 4  min_hits           = {args.min_hits}")
-    print(f"[INFO]   Stage 5  energy_top_k       = {args.energy_top_k}")
-    print(f"[INFO]            energy_export_thr  = {args.energy_export_thr}")
-    print(f"[INFO] ── Tracker ─────────────────────────────────────────────")
-    print(f"[INFO]   iou_thr     = {args.iou_thr}")
-    print(f"[INFO]   max_age     = {args.max_age}")
-    print(f"[INFO]   coast_decay = {args.coast_decay}")
+    print(f"[INFO]   score_thr  (scaled) = {args.score_thr}")
+    print(f"[INFO]   nms_iou             = {args.nms_iou}")
+    print(f"[INFO]   track_iou           = {args.track_iou}")
+    print(f"[INFO]   min_age             = {args.min_age}")
+    print(f"[INFO]   max_missed          = {args.max_missed}")
+    print(f"[INFO]   n_peaks             = {args.n_peaks}")
+    print(f"[INFO]   dist_scale          = {args.dist_scale}")
     print(f"[INFO] ────────────────────────────────────────────────────────\n")
 
     model      = load_model(args.checkpoint, args.num_classes)
     test_infos = get_sequence_infos(args.split, LABELS_BASE, FRAMES_BASE)
 
     if not test_infos:
-        print(f"[ERROR] No sequences found — split='{args.split}'")
+        print(f"[ERROR] No sequences found for split='{args.split}'")
         sys.exit(1)
 
-    if args.num_seqs is not None:
-        if args.num_seqs >= len(test_infos):
-            print(f"[INFO] Requested num_seqs ({args.num_seqs}) >= available "
-                  f"({len(test_infos)}). Using all.")
-        else:
-            print(f"[INFO] Randomly sampling {args.num_seqs} / {len(test_infos)} sequences")
-            test_infos = random.sample(test_infos, args.num_seqs)
+    if 0 < args.n_seqs < len(test_infos):
+        indices   = np.linspace(0, len(test_infos) - 1, args.n_seqs).astype(int)
+        test_infos = [test_infos[i] for i in indices]
 
     print(f"[INFO] {len(test_infos)} sequences to process.\n")
 
-    wall_t0      = time.time()
-    output_files = []
+    total_annots = 0
     skipped      = []
 
     for seq_idx, (json_path, seq_dir, seq_name) in enumerate(test_infos, 1):
         print(f"\n{'='*60}")
         print(f"[{seq_idx:3d}/{len(test_infos)}]  {seq_name}")
 
+        # Combine on-disk frames with annotated frame indices
         try:
+            import json as _json
             with open(json_path) as jf:
-                ann_data = json.load(jf)
+                ann_data = _json.load(jf)
             annotated_ids = sorted(
                 {int(a["metadata_frame_index"])
                  for a in ann_data.get("annotations", [])})
@@ -701,44 +757,36 @@ def main():
         print(f"  Frames: {len(all_ids)}  "
               f"(annotated={len(annotated_ids)}, on-disk={len(disk_ids)})")
 
-        results = run_inference_on_sequence(
-            model              = model,
-            seq_dir            = seq_dir,
-            seq_name           = seq_name,
-            frame_indices      = all_ids,
-            score_thr          = args.score_thr,
-            nms_iou_thr        = args.nms_iou_thr,
-            max_dets_per_class = args.max_dets_per_class,
-            min_hits           = args.min_hits,
-            iou_thr            = args.iou_thr,
-            max_age            = args.max_age,
-            batch_size         = args.batch_size,
-            num_workers        = args.num_workers,
-            coast_decay        = args.coast_decay,
+        annotations = infer_sequence(
+            model          = model,
+            seq_dir        = seq_dir,
+            seq_name       = seq_name,
+            frame_indices  = all_ids,   # union of GT-annotated + on-disk frames
+            batch_size     = args.batch_size,
+            num_workers    = args.num_workers,
+            score_thr      = args.score_thr,
+            nms_iou        = args.nms_iou,
+            track_iou      = args.track_iou,
+            min_age        = args.min_age,
+            max_missed     = args.max_missed,
+            n_peaks        = args.n_peaks,
+            dist_scale     = args.dist_scale,
         )
 
-        print_summary(results, seq_name, args.min_hits)
+        json_out = out_dir / f"{seq_name}.json"
+        with open(json_out, "w") as f:
+            json.dump({"annotations": annotations}, f, separators=(",", ":"))
 
-        out_json = os.path.join(args.out_dir, f"{seq_name}_inference.json")
-        dump_inference_json(
-            results           = results,
-            save_path         = out_json,
-            min_hits          = args.min_hits,
-            energy_top_k      = args.energy_top_k,
-            energy_export_thr = args.energy_export_thr,
-        )
-        output_files.append(out_json)
+        n        = len(annotations)
+        total_annots += n
+        size_kb  = json_out.stat().st_size / 1024
+        print(f"  → {n:5d} annotations  |  {size_kb:>7.1f} KB  →  {json_out.name}")
 
-    wall_elapsed = time.time() - wall_t0
     print(f"\n{'='*60}")
-    print(f"  DONE — {len(output_files)}/{len(test_infos)} sequences")
+    print(f"[DONE] {len(test_infos) - len(skipped)}/{len(test_infos)} sequences written to {out_dir}/")
     if skipped:
-        print(f"  Skipped  : {', '.join(skipped)}")
-    print(f"  Wall time: {wall_elapsed:.1f}s  ({wall_elapsed/60:.1f} min)")
-    print(f"  Output   : {os.path.abspath(args.out_dir)}")
-    for fpath in output_files:
-        print(f"    {os.path.basename(fpath):<50s}  "
-              f"{os.path.getsize(fpath)/1024:.1f} KB")
+        print(f"  Skipped : {', '.join(skipped)}")
+    print(f"  Total annotations : {total_annots:,}")
     print(f"{'='*60}\n")
 
 
