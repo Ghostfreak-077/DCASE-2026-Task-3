@@ -383,7 +383,10 @@ class UNetSAISELD(nn.Module):
 
                     # FIX 3: Focal loss
                     cw    = self.class_weights[cls_idx]
-                    focal = self._focal_bce(pred_mask_nc, gt_mask) * cw
+
+                    with torch.amp.autocast("cuda", enabled=False):
+                        pred_clamped = pred_mask_nc.float().clamp(1e-6, 1.0 - 1e-6)
+                        focal = self._focal_bce(pred_clamped, gt_mask.float()) * cw
 
                     # Dice (handles imbalance from the overlap side)
                     inter = (pred_mask_nc * gt_mask).sum()
@@ -392,7 +395,8 @@ class UNetSAISELD(nn.Module):
 
                     # Energy MSE only on GT-annotated pixels
                     ann_px = gt_mask > 0.5
-                    e_mse  = (F.mse_loss(pred_energy_nc[ann_px], gt_emap[ann_px])
+
+                    e_mse  = (F.mse_loss(pred_energy_nc[ann_px].float(), gt_emap[ann_px].float())
                               if ann_px.any()
                               else pred_energy_nc.new_zeros(1).squeeze())
 

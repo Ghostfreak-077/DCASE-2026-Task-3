@@ -99,7 +99,7 @@ def detect_resources():
     if   gpu_vram_gb >= 40: batch_size = 48
     elif gpu_vram_gb >= 24: batch_size = 24
     elif gpu_vram_gb >= 16: batch_size = 16
-    else:                   batch_size = 8
+    else:                   batch_size = 32
 
     pin = torch.cuda.is_available()
 
@@ -124,8 +124,8 @@ IMG_W, IMG_H = 360, 180
 NUM_CLASSES  = 14      # 13 sound classes + background
 NUM_EPOCHS   = 10
 
-TRAIN_FRAMES_PER_EPOCH = 15
-VAL_FRAMES_PER_EPOCH   = 15
+TRAIN_FRAMES_PER_EPOCH = 15000
+VAL_FRAMES_PER_EPOCH   = 150
 
 DIST_NORM        = 500.0
 ENERGY_ANNOT_W   = 5.0
@@ -341,7 +341,7 @@ def train(train_infos, val_infos, exp_dir):
         worker_init_fn     = worker_init_fn if num_workers > 0 else None,
         persistent_workers = False,
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,   shuffle=True,  **loader_kw)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size*2,   shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size*2, shuffle=False, **loader_kw)
 
     # ── Model ────────────────────────────────────────────────────────────
