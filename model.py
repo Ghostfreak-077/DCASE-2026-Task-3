@@ -58,7 +58,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.ops import box_iou
 from scipy.optimize import linear_sum_assignment
-
+import matplotlib.pyplot as plt
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1.  BUILDING BLOCKS
@@ -230,7 +230,7 @@ class UNetSAISELD(nn.Module):
         in_ch:          int   = 4,
         img_h:          int   = 180,
         img_w:          int   = 360,
-        energy_annot_w: float = 5.0,
+        energy_annot_w: float = 50.0,
         dist_w:         float = 15.0,
         dropout:        float = 0.1,
         class_weights:  torch.Tensor = None,
@@ -310,8 +310,30 @@ class UNetSAISELD(nn.Module):
         mask_maps   = self.mask_head(d)          # (B, N_CLASSES, 180, 360)
         dist_pred   = self.distance_head(e3)     # (B, N_CLASSES)
 
+        # print("Energy map",energy_maps.min(), energy_maps.max(), energy_maps.mean())
+        # print("Distance map", dist_pred.min(), dist_pred.max(), dist_pred.mean())
+
+        if epoch%25 == 0:
+            print("\nPER-CLASS ENERGY MAX") 
+
+            for c in range(energy_maps.shape[1]):
+                print(
+                        c,
+                        float(energy_maps[0, c].max())
+                    )
+            print(targets[0]['labels'])
+
+        # print(energy_maps[0].shape)
+        # plt.imshow(energy_maps[0][target_class[0]].detach().cpu())
+        # plt.savefig('pred.png')
+
         if self.training:
             assert targets is not None
+            # print("pred max", energy_maps.max().item())
+            # print("target max", targets[''].max().item())
+
+            # print("pred mean", pred_energy.mean().item())
+            # print("target mean", target_energy.mean().item())
             return self._compute_loss(energy_maps, mask_maps, dist_pred, targets, x.device, epoch)
         else:
             return self._build_detections(energy_maps, mask_maps, dist_pred)
@@ -363,16 +385,78 @@ class UNetSAISELD(nn.Module):
             dists    = tgt["distances"].to(device)
 
             # ── Full-image energy map loss ────────────────────────────────
-            pred_combined = energy_maps[i].max(dim=0).values
-            W             = torch.ones(self.img_h, self.img_w, device=device)
-            W[vmask]      = self.energy_annot_w
-            loss_energy   = loss_energy + (W * (pred_combined - vmap).pow(2)).mean()
+            # pred_combined = energy_maps[i].max(dim=0).values
+            # W             = torch.ones(self.img_h, self.img_w, device=device)
+            # W[vmask]      = self.energy_annot_w
+            # loss_energy   = loss_energy + (W * (pred_combined - vmap).pow(2)).mean()
+
+            # ── Full-image energy map loss (class-aware) ──────────────────
+            cls_idx = int(labels[0].item())
+            gt_map = emaps[0]   # first object
+            gt_flat = torch.argmax(gt_map)
+            gt_y, gt_x = torch.unravel_index(gt_flat, gt_map.shape)
+            pred_map = energy_maps[0, cls_idx]  # GT class channel
+            pred_flat = torch.argmax(pred_map)
+            pred_y, pred_x = torch.unravel_index(pred_flat, pred_map.shape)
+            print(f"GT peak   : ({gt_x.item()}, {gt_y.item()})")
+            print(f"Pred peak : ({pred_x.item()}, {pred_y.item()})")
+            N = len(labels)
+
+            for n in range(N):
+                cls_idx = int(labels[n].item())
+
+                if cls_idx < 1 or cls_idx >= self.n_classes:
+                    continue
+
+                pred_energy_nc = energy_maps[i, cls_idx]
+                gt_emap        = emaps[n]
+
+
+                W = torch.ones_like(gt_emap)
+                ann_px = gt_emap > 0
+
+                W[ann_px] = self.energy_annot_w
+
+                pred_clamped = pred_energy_nc.clamp(1e-6, 1 - 1e-6)
+
+                bce = F.binary_cross_entropy(
+                    pred_clamped,
+                    gt_emap.float(),
+                    reduction="none"
+                )
+
+                loss_energy = loss_energy + (W * bce).mean()
+
+            if epoch in [1, 10, 25, 50]:
+                print(epoch, loss_energy.item())
+
+                # loss_energy = loss_energy + (
+                #     W * (pred_energy_nc - gt_emap).pow(2)
+                # ).mean()
+
+            # loss_pos = ((pred_combined[vmask] - vmap[vmask])**2).mean()
+
+            # loss_neg = ((pred_combined[~vmask] - vmap[~vmask])**2).mean()
+
+            # print(1)
+            # print(loss_pos)
+            # print(loss_neg)
 
             # ── FIX 4: mask loss ONLY on frames with annotations ─────────
             N = len(labels)
             if N > 0:
                 for n in range(N):
                     cls_idx = int(labels[n].item())
+
+                    if i == 0 and n == 0 and epoch in [10, 15, 20]:
+                        print("GT class:", cls_idx)
+
+                        for c in range(self.n_classes):
+                            print(
+                                c,
+                                float(energy_maps[i, c].max())
+                            )
+
                     if cls_idx < 1 or cls_idx >= self.n_classes:
                         continue
 
@@ -380,6 +464,8 @@ class UNetSAISELD(nn.Module):
                     pred_energy_nc = energy_maps[i, cls_idx]
                     gt_mask        = emasks[n].float()
                     gt_emap        = emaps[n]
+
+                    
 
                     # FIX 3: Focal loss
                     cw    = self.class_weights[cls_idx]
@@ -394,7 +480,10 @@ class UNetSAISELD(nn.Module):
                     dice  = 1.0 - 2.0 * inter / denom
 
                     # Energy MSE only on GT-annotated pixels
-                    ann_px = gt_mask > 0.5
+                    ann_px = gt_mask > 0.8
+
+                    # print(pred_energy_nc[ann_px].mean())
+                    # print(pred_energy_nc[~ann_px].mean())
 
                     e_mse  = (F.mse_loss(pred_energy_nc[ann_px].float(), gt_emap[ann_px].float())
                               if ann_px.any()
@@ -417,8 +506,8 @@ class UNetSAISELD(nn.Module):
         denom = max(B, 1)
         return {
             "loss_energy":   loss_energy / denom,
-            "loss_mask":     loss_mask   / max(n_instances, 1),
-            "loss_distance": dist_ramp * loss_dist / max(n_dist_terms, 1),
+            "loss_mask":     (loss_mask   / max(n_instances, 1)).new_zeros(()),
+            "loss_distance": (dist_ramp * loss_dist / max(n_dist_terms, 1)).new_zeros(()),
         }
 
     # ------------------------------------------------------------------

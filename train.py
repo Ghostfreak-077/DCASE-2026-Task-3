@@ -28,6 +28,8 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 
+import matplotlib.pyplot as plt
+
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -99,7 +101,7 @@ def detect_resources():
     if   gpu_vram_gb >= 40: batch_size = 48
     elif gpu_vram_gb >= 24: batch_size = 24
     elif gpu_vram_gb >= 16: batch_size = 16
-    else:                   batch_size = 32
+    else:                   batch_size = 8
 
     pin = torch.cuda.is_available()
 
@@ -122,15 +124,15 @@ MIC_BASE    = "/teamspace/studios/this_studio/data/foa_dev"
 
 IMG_W, IMG_H = 360, 180
 NUM_CLASSES  = 14      # 13 sound classes + background
-NUM_EPOCHS   = 10
+NUM_EPOCHS   = 100
 
-TRAIN_FRAMES_PER_EPOCH = 15000
-VAL_FRAMES_PER_EPOCH   = 150
+TRAIN_FRAMES_PER_EPOCH = None
+VAL_FRAMES_PER_EPOCH   = 15
 
 DIST_NORM        = 500.0
 ENERGY_ANNOT_W   = 5.0
 DIST_W           = 15.0    # elevated from baseline (was ~1)
-PATIENCE         = 15
+PATIENCE         = 100
 SCHEDULER_PATIENCE = 3
 
 # Learning rates for the two-group schedule
@@ -303,6 +305,9 @@ def train(train_infos, val_infos, exp_dir):
         augmentor          = train_augmentor,
     )
 
+    # One-sample overfit test
+    train_dataset.current_indices = np.array([0])
+
     # Class weights (same smoothed-sqrt approach as baseline)
     print("[TRAIN] Calculating class weights…")
     ann_counts = {k: len(v) for k, v in train_dataset.class_to_sample_indices.items()}
@@ -408,7 +413,9 @@ def train(train_infos, val_infos, exp_dir):
 
     for epoch in range(1, NUM_EPOCHS + 1):
 
-        train_dataset.reset_epoch(balanced=True)
+        # train_dataset.reset_epoch(balanced=True)
+        # One-sample overfit test
+        train_dataset.current_indices = np.array([0])
 
         # ── Freeze schedule ──────────────────────────────────────────────
         phase, n_train, n_total_p = apply_encoder_freeze(model, epoch)
@@ -451,6 +458,41 @@ def train(train_infos, val_infos, exp_dir):
             ]
 
             optimizer.zero_grad(set_to_none=True)
+
+
+            # print(images[0].shape)
+            # print(images[0].min())
+            # print(images[0].max())
+            # print(images[0].mean())
+
+
+            # feat = images[0]
+
+            # for c in range(feat.shape[0]):
+            #     print(
+            #         c,
+            #         feat[c].min().item(),
+            #         feat[c].max().item(),
+            #         feat[c].mean().item()
+            #     )
+
+            # for c in range(targets[0]['energy_maps'].shape[0]):
+            #     print(
+            #         targets[0]['labels'],
+            #         targets[0]['energy_maps'].max().item(),
+            #         targets[0]['energy_maps'].sum().item()
+            #     )
+
+            # state = torch.load('./experiments/debug_20260531_180952/unet_saiseld_best.pth', map_location=DEVICE, weights_only=True)
+            # if isinstance(state, dict):
+            #     if   "model_state"      in state: state = state["model_state"]
+            #     elif "model_state_dict" in state: state = state["model_state_dict"]
+            # missing, unexpected = model.load_state_dict(state, strict=True)
+            # if missing:    print(f"[WARN] Missing keys    : {missing}")
+            # if unexpected: print(f"[WARN] Unexpected keys : {unexpected}")
+
+            # plt.imshow(targets[0]['energy_maps'][0].cpu())
+            # plt.savefig('img.png')
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 loss_dict = model(images, targets, epoch=epoch)
@@ -513,7 +555,6 @@ def train(train_infos, val_infos, exp_dir):
         for k in sorted(ep_losses):
             if k != "total":
                 print(f"{k}={history[k][-1]:.4f}  ", end="")
-        print()
 
         val_avg = float("inf")
         if val_n > 0:
