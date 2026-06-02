@@ -21,12 +21,10 @@ import os
 import sys
 import time
 import math
-import random
 import argparse
 import shutil
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager
 
 from tqdm import tqdm
 import torch
@@ -37,79 +35,25 @@ from torch.utils.data import DataLoader
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
-from acoustic_features import SalsaFeatureExtractor
-from augmentation import SeldAugmentor
-from model import (
+from utils.acoustic_features import SalsaFeatureExtractor
+from utils.augmentation import SeldAugmentor
+from models.model import UNetSAISELD
+from data.dataset import (
     get_sequence_infos,
     EnergySegDataset,
     collate_fn,
     worker_init_fn,
-    UNetSAISELD,
 )
-
-# ════════════════════════════════════════════════════════════════════════════
-# 0.  UTILITIES
-# ════════════════════════════════════════════════════════════════════════════
-
-class Logger:
-    def __init__(self, filename, stream=sys.stdout):
-        self.terminal = stream
-        self.log      = open(filename, "a", encoding="utf-8")
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
-
-
-def set_seed(seed=42):
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 1.  AUTO-DETECT RESOURCES
-# ════════════════════════════════════════════════════════════════════════════
-
-def detect_resources():
-    import psutil
-    total_ram_gb = psutil.virtual_memory().total / 1e9
-    cpu_count    = os.cpu_count() or 1
-    gpu_vram_gb  = 0.0
-
-    if torch.cuda.is_available():
-        props       = torch.cuda.get_device_properties(0)
-        gpu_vram_gb = props.total_memory / 1e9
-
-    num_workers  = min(max(cpu_count - 1, 0), 8)
-    cache_per_ds = min(512, max(100, int(total_ram_gb * 6)))
-
-    # UNetSAISELD is lighter than Mask R-CNN; can fit larger batches
-    if   gpu_vram_gb >= 40: batch_size = 48
-    elif gpu_vram_gb >= 24: batch_size = 24
-    elif gpu_vram_gb >= 16: batch_size = 16
-    else:                   batch_size = 32
-
-    pin = torch.cuda.is_available()
-
-    print(f"\n[TUNING] BATCH_SIZE  = {batch_size}")
-    print(f"[TUNING] NUM_WORKERS = {num_workers}")
-    print(f"[TUNING] CACHE_MAX   = {cache_per_ds} frames per dataset")
-    print(f"[TUNING] RAM         = {total_ram_gb:.1f} GB")
-    print(f"[TUNING] pin_memory  = {pin}\n")
-
-    return batch_size, num_workers, cache_per_ds, pin
+from utils.utils import (
+    Logger,
+    apply_encoder_freeze,
+    detect_resources,
+    eval_behavior_for_loss,
+    plot_losses,
+    set_seed
+)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -117,15 +61,15 @@ def detect_resources():
 # ════════════════════════════════════════════════════════════════════════════
 
 FRAMES_BASE = "/teamspace/studios/this_studio/data/"
-LABELS_BASE = "/teamspace/studios/this_studio/data/labels_dev"
+LABELS_BASE = "/teamspace/studios/this_studio/gaussian_dataset/labels_dev"
 MIC_BASE    = "/teamspace/studios/this_studio/data/foa_dev"
 
 IMG_W, IMG_H = 360, 180
 NUM_CLASSES  = 14      # 13 sound classes + background
 NUM_EPOCHS   = 10
 
-TRAIN_FRAMES_PER_EPOCH = 15000
-VAL_FRAMES_PER_EPOCH   = 150
+TRAIN_FRAMES_PER_EPOCH = 15
+VAL_FRAMES_PER_EPOCH   = 15
 
 DIST_NORM        = 500.0
 ENERGY_ANNOT_W   = 5.0
@@ -137,9 +81,6 @@ SCHEDULER_PATIENCE = 3
 LR_ENCODER = 5e-5   # lower — encoder starts partially frozen
 LR_HEADS   = 5e-4   # higher — heads train aggressively
 
-# Epoch at which the full encoder is unfrozen
-ENCODER_UNFREEZE_EPOCH = 3
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -147,99 +88,6 @@ if torch.cuda.is_available():
 else:
     print(f"[INFO] Device: {DEVICE}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# 3.  PROGRESSIVE ENCODER FREEZE
-# ════════════════════════════════════════════════════════════════════════════
-
-def apply_encoder_freeze(model: UNetSAISELD, epoch: int) -> str:
-    """
-    Epoch 1-2 : enc3 + bridge + decoder + heads  (encoder enc0-2 frozen)
-    Epoch 3+  : full model trainable
-    """
-    if epoch < ENCODER_UNFREEZE_EPOCH:
-        # Freeze enc0, enc1, enc2
-        for module in (model.enc0, model.enc1, model.enc2):
-            for p in module.parameters():
-                p.requires_grad = False
-        for module in (model.enc3,
-                    #     model.bridge_pool, model.bridge_conv,
-                    #    model.skip_pool3, model.skip_pool2, model.skip_pool1,
-                    #    model.dec3, model.dec2, model.dec1, model.dec0,
-                       model.energy_head, model.mask_head, model.distance_head):
-            for p in module.parameters():
-                p.requires_grad = True
-        phase = "enc3+bridge+decoder+heads"
-    else:
-        for p in model.parameters():
-            p.requires_grad = True
-        phase = "full_model"
-
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_total = sum(p.numel() for p in model.parameters())
-    return phase, n_train, n_total
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 4.  PLOTTING
-# ════════════════════════════════════════════════════════════════════════════
-
-def plot_losses(history: dict, save_path: str):
-    base_keys = [k for k in history if not k.startswith("val_") and k != "total"]
-    all_keys  = ["total"] + sorted(base_keys)
-    epochs    = range(1, len(history.get("total", [])) + 1)
-    n_plots   = len(all_keys)
-    cols, rows = 4, math.ceil(n_plots / 4)
-
-    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4 * rows))
-    axes      = np.array(axes).flatten()
-    fig.suptitle("UNetSAISELD — Training & Validation Loss", fontsize=14, y=1.01)
-
-    def smooth(v, k=7):
-        if len(v) < k:
-            return v, 0
-        k = max(3, min(k, (len(v) // 3) * 2 + 1) | 1)
-        return np.convolve(v, np.ones(k) / k, "valid"), k // 2
-
-    for i, key in enumerate(all_keys):
-        ax    = axes[i]
-        vals  = history.get(key, [])
-        title = "Total" if key == "total" else key.replace("loss_", "").replace("_", " ").title()
-        ax.plot(list(epochs), vals, lw=1, color="steelblue", alpha=0.4, label="train")
-        if len(vals) >= 5:
-            s, pad = smooth(vals)
-            ax.plot(list(range(pad + 1, len(vals) - pad + 1)), s, lw=2, color="orangered", label="train (sm)")
-        val_key = "val_total" if key == "total" else f"val_{key}"
-        if val_key in history and len(history[val_key]) == len(epochs):
-            ax.plot(list(epochs), history[val_key], lw=2, color="green", label="val")
-        ax.legend(fontsize=7); ax.set_title(title, fontsize=10, fontweight="bold")
-        ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.grid(alpha=0.3)
-
-    for j in range(i + 1, len(axes)):
-        axes[j].axis("off")
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[PLOT] Loss curves → {save_path}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 5.  EVAL CONTEXT MANAGER
-# ════════════════════════════════════════════════════════════════════════════
-
-@contextmanager
-def eval_behavior_for_loss(model):
-    target_types = (nn.BatchNorm1d, nn.BatchNorm2d, nn.Dropout, nn.Dropout2d)
-    modules      = [m for m in model.modules() if isinstance(m, target_types)]
-    orig         = {m: m.training for m in modules}
-    for m in modules:
-        m.eval()
-    try:
-        yield
-    finally:
-        for m, s in orig.items():
-            m.train(mode=s)
 
 
 # ════════════════════════════════════════════════════════════════════════════

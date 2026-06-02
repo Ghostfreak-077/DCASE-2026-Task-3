@@ -95,7 +95,7 @@ def set_seed(seed=42):
 # ══════════════════════════════════════════════════════════════════════════════
 
 FRAMES_BASE = "/teamspace/studios/this_studio/data/"
-LABELS_BASE = "/teamspace/studios/this_studio/data/labels_dev"
+LABELS_BASE = "/teamspace/studios/this_studio/gaussian_dataset/labels_dev"
 MIC_BASE    = "/teamspace/studios/this_studio/data/foa_dev"
 
 IMG_W, IMG_H = 360, 180
@@ -408,14 +408,17 @@ def extract_peaks(
 
     roi_w = xi1 - xi0
     triplets = []
-    for i in top_idx:
+    for j, i in enumerate(top_idx):
         ry, rx = divmod(int(i), roi_w)
         ox = float(xi0 + rx)
         oy = float(yi0 + ry)
         # Clamp to valid submission range
         ox = min(max(ox, 0.0), float(IMG_W - 1))
         oy = min(max(oy, 0.0), float(IMG_H - 1))
-        triplets.append([round(ox, 2), round(oy, 2), round(float(flat[i]), 4)])
+        # triplets.append([round(ox, 2), round(oy, 2), round(float(flat[i]), 4)])
+        raw_vals = region.ravel()
+        # ... inside the loop, change to:
+        triplets.append([round(ox, 2), round(oy, 2), round(float(raw_vals[top_idx[j]]), 4)])
 
     return triplets
 
