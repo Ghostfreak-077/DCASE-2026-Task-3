@@ -155,7 +155,7 @@ def detect_resources():
     if   gpu_vram_gb >= 40: batch_size = 48
     elif gpu_vram_gb >= 24: batch_size = 24
     elif gpu_vram_gb >= 16: batch_size = 16
-    else:                   batch_size = 32
+    else:                   batch_size = 8
 
     pin = torch.cuda.is_available()
 
@@ -182,7 +182,8 @@ def apply_encoder_freeze(model: UNetSAISELD, epoch: int) -> str:
         for module in (model.enc0, model.enc1, model.enc2):
             for p in module.parameters():
                 p.requires_grad = False
-        for module in (model.enc3,
+        for module in (
+            # model.enc3,
                     #     model.bridge_pool, model.bridge_conv,
                     #    model.skip_pool3, model.skip_pool2, model.skip_pool1,
                     #    model.dec3, model.dec2, model.dec1, model.dec0,

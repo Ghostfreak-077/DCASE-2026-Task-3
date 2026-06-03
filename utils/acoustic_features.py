@@ -108,6 +108,16 @@ class _SalsaLiteCore:
 
         return S.T  # (n_bins, target_frames)
 
+    def _gcc_phat(self, sig_i: np.ndarray, sig_j: np.ndarray, max_tau: int) -> np.ndarray:
+        n = self.n_fft
+        Si = np.fft.rfft(sig_i, n=n)
+        Sj = np.fft.rfft(sig_j, n=n)
+        R  = Si * np.conj(Sj)
+        R /= (np.abs(R) + 1e-10)
+        cc = np.fft.irfft(R, n=n)
+        cc = np.concatenate([cc[-max_tau:], cc[:max_tau+1]])  # (2*max_tau+1,)
+        return cc.astype(self.F_DTYPE)
+
     # ------------------------------------------------------------------
     def __call__(self, audio: np.ndarray, target_frames: int) -> np.ndarray:
         """
@@ -154,7 +164,24 @@ class _SalsaLiteCore:
 
         nipv = np.concatenate(nipv_list, axis=0)  # (n_ch-1, T, freq_bins)
 
-        features = np.concatenate([log_spec, nipv], axis=0)  # (n_ch, T, freq_bins)
+        features = np.concatenate([log_spec, nipv], axis=0)  # (4, T, freq_bins)
+
+        # --- GCC-PHAT across all mic pairs ---
+        max_tau = self.n_fft // 2
+        pairs = [(i, j) for i in range(n_ch) for j in range(i+1, n_ch)]
+        gcc_list = []
+        for (i, j) in pairs:
+            cc = self._gcc_phat(audio[i], audio[j], max_tau)  # (2*max_tau+1,)
+            cc_interp = np.interp(
+                np.linspace(0, 1, self.freq_bins),
+                np.linspace(0, 1, len(cc)),
+                cc
+            )
+            gcc_frame = np.tile(cc_interp, (target_frames, 1))[np.newaxis, :, :]  # (1, T, freq_bins)
+            gcc_list.append(gcc_frame)
+
+        gcc = np.concatenate(gcc_list, axis=0)  # (6, T, freq_bins)
+        features = np.concatenate([features, gcc], axis=0)  # (10, T, freq_bins)
         return features.astype(self.F_DTYPE)
 
 
@@ -216,7 +243,7 @@ class SalsaFeatureExtractor:
         self._frame_cache_size = frame_cache_size
 
         # Expose feature shape for downstream modules
-        self.n_channels  = 4                       # 1 log-mel + 3 NIPV
+        self.n_channels  = 10                      # 1 log-mel + 3 NIPV
         self.n_time      = round(self.frame_samples / hop_length) + 1   # ~8
         self.freq_bins   = self.core.freq_bins     # 128
 
